@@ -1,0 +1,50 @@
+name: Autonomous Jules POC Generator
+
+on:
+  repository_dispatch:
+    types: [trigger_jules_poc]
+
+jobs:
+  run-jules-agent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Jules Tools CLI
+        run: npm install -g @google/jules-tools
+
+      - name: Run Jules to Generate POC & PR
+        env:
+          JULES_API_KEY: ${{ secrets.JULES_API_KEY }} # 你的 Google AI Studio/Jules API 密钥
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROMPT: ${{ github.event.client_payload.prompt }}
+          CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+        run: |
+          # 生成唯一的分支名称
+          BRANCH_NAME="feat/poc-$(date +%s)"
+          
+          echo "Starting Jules task for branch: $BRANCH_NAME"
+
+          # 启动 Jules 异步处理，强制其理解 Angular 上下文
+          # (参数可能随 CLI 版本微调，此为标准用法)
+          jules task create \
+            --prompt "这是一个 Angular Monorepo。请基于以下需求生成一个新的独立组件或子应用：'$PROMPT'。请确保包含完整的 TypeScript 逻辑、HTML 模板，并使用 TailwindCSS 进行样式布局。" \
+            --branch $BRANCH_NAME \
+            --create-pr \
+            --pr-title "🤖 [POC] 自动生成的原型功能" \
+            --pr-body "由 Telegram 触发，Google Jules AI 生成的代码。"
+
+          # Jules 提完 PR 后，给 Telegram 发送完成通知
+          PR_URL="https://github.com/${{ github.repository }}/pulls"
+          curl -s -X POST https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage \
+            -d chat_id=$CHAT_ID \
+            -d text="🎉 POC 代码已生成并提交！分支持续集成中... 
+            🔗 点击查看 PR: $PR_URL
+            🌐 Vercel/Netlify 预览链接将稍后在 PR 评论区生成。"
