@@ -1,0 +1,228 @@
+name: 🚀 Build & Deploy POC
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/**'
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: 'App name to force rebuild (leave empty to auto-detect)'
+        required: false
+        type: string
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ─── Detect which apps changed ───────────────────────────────────────────────
+  detect-changes:
+    name: 🔍 Detect changed apps
+    runs-on: ubuntu-latest
+    outputs:
+      apps: ${{ steps.detect.outputs.apps }}
+      has_changes: ${{ steps.detect.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed apps
+        id: detect
+        run: |
+          if [ -n "${{ github.event.inputs.app_name }}" ]; then
+            # Manual trigger with specific app
+            APPS='["${{ github.event.inputs.app_name }}"]'
+            echo "apps=$APPS" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR: compare base..head
+            CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD \
+              | grep '^apps/' | cut -d'/' -f2 | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          else
+            # Push to main: compare with previous commit
+            CHANGED=$(git diff --name-only HEAD~1 HEAD \
+              | grep '^apps/' | cut -d'/' -f2 | sort -u | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
+
+          if [ -z "$APPS" ]; then
+            APPS=$CHANGED
+          fi
+
+          echo "Detected apps: $APPS"
+          echo "apps=$APPS" >> $GITHUB_OUTPUT
+
+          COUNT=$(echo "$APPS" | jq 'length')
+          if [ "$COUNT" -gt "0" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+
+  # ─── Build each changed app ──────────────────────────────────────────────────
+  build:
+    name: 🔨 Build ${{ matrix.app }}
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.detect-changes.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: apps/${{ matrix.app }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/${{ matrix.app }}
+        run: npm ci
+
+      - name: Build Angular app
+        working-directory: apps/${{ matrix.app }}
+        run: |
+          npx ng build \
+            --configuration production \
+            --base-href /${{ github.event.repository.name }}/${{ matrix.app }}/
+        env:
+          NODE_OPTIONS: '--max-old-space-size=4096'
+
+      - name: Prepare dist output
+        run: |
+          mkdir -p dist-output/${{ matrix.app }}
+          # Angular 17+ outputs to dist/<project-name>/browser
+          SRC=$(find apps/${{ matrix.app }}/dist -name "browser" -type d 2>/dev/null || \
+                find apps/${{ matrix.app }}/dist -mindepth 1 -maxdepth 2 -type d | head -1)
+          cp -r $SRC/. dist-output/${{ matrix.app }}/
+          echo "✅ Built: ${{ matrix.app }}"
+          ls dist-output/${{ matrix.app }}/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.app }}
+          path: dist-output/${{ matrix.app }}
+          retention-days: 1
+
+  # ─── Deploy to GitHub Pages ───────────────────────────────────────────────────
+  deploy:
+    name: 🌐 Deploy to GitHub Pages
+    needs: [detect-changes, build]
+    if: |
+      needs.detect-changes.outputs.has_changes == 'true' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+        continue-on-error: true
+
+      - name: Checkout main for index
+        uses: actions/checkout@v4
+        with:
+          path: main-repo
+
+      - name: Setup Pages directory
+        run: |
+          # If gh-pages branch doesn't exist or is empty, start fresh
+          if [ ! -f "index.html" ]; then
+            echo "Starting fresh gh-pages"
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: downloaded-artifacts
+
+      - name: Deploy each app to subdirectory
+        run: |
+          for dir in downloaded-artifacts/dist-*/; do
+            APP=$(basename "$dir" | sed 's/^dist-//')
+            mkdir -p "$APP"
+            cp -r "$dir"/* "$APP/"
+            echo "✅ Deployed $APP to /$APP/"
+          done
+
+      - name: Regenerate hub index page
+        run: |
+          # Collect all deployed apps (existing + newly deployed)
+          APPS=$(ls -d */ 2>/dev/null | grep -v '^\.' | sed 's|/||' | sort)
+          cat main-repo/scripts/generate-index.sh | bash - "$APPS" > index.html || \
+          node main-repo/scripts/generate-index.js "$APPS" > index.html || true
+
+          # Fallback: simple index
+          if [ ! -s "index.html" ]; then
+            cp main-repo/index-template.html index.html 2>/dev/null || \
+            echo "<html><body><h1>POC Hub</h1></body></html>" > index.html
+          fi
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: .
+          keep_files: true
+          commit_message: "deploy: ${{ join(fromJson(needs.detect-changes.outputs.apps), ', ') }}"
+          exclude_assets: '.github,main-repo,downloaded-artifacts'
+
+  # ─── Notify via Telegram ──────────────────────────────────────────────────────
+  notify:
+    name: 📬 Notify Telegram
+    needs: [detect-changes, build, deploy]
+    if: |
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      needs.detect-changes.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send success notification
+        if: needs.deploy.result == 'success'
+        run: |
+          APPS='${{ needs.detect-changes.outputs.apps }}'
+          REPO="${{ github.event.repository.name }}"
+          OWNER="${{ github.repository_owner }}"
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+
+          # Build message
+          MESSAGE="✅ *POC 部署成功！*%0A%0A"
+          for app in $(echo $APPS | jq -r '.[]'); do
+            MESSAGE="${MESSAGE}🔗 [${app}](https://${OWNER}.github.io/${REPO}/${app}/)%0A"
+          done
+          MESSAGE="${MESSAGE}%0A📦 [查看 Commit](https://github.com/${{ github.repository }}/commit/${{ github.sha }})"
+
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown" \
+            -d "disable_web_page_preview=false"
+
+      - name: Send failure notification
+        if: needs.build.result == 'failure' || needs.deploy.result == 'failure'
+        run: |
+          MESSAGE="❌ *POC 构建/部署失败*%0A%0A"
+          MESSAGE="${MESSAGE}📦 Apps: ${{ needs.detect-changes.outputs.apps }}%0A"
+          MESSAGE="${MESSAGE}🔍 [查看日志](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "text=${MESSAGE}" \
+            -d "parse_mode=Markdown"

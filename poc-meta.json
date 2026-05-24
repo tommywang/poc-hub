@@ -1,0 +1,13 @@
+{
+  "_comment": "Auto-maintained by the Telegram Bot service. Do not edit manually.",
+  "_schema": {
+    "appName": {
+      "description": "One-line description of the POC",
+      "tags": ["angular", "feature-area"],
+      "createdAt": "ISO8601 timestamp",
+      "prompt": "Original user prompt",
+      "prUrl": "GitHub PR URL",
+      "author": "Telegram user ID"
+    }
+  }
+}
